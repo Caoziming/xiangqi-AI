@@ -73,7 +73,7 @@
 
   <div class="side">
     <div class="card">
-      <h1>中国象棋 <span class="badge">AI 引擎</span></h1>
+      <h1>中国象棋 <span class="badge">v2 强化引擎</span></h1>
       <div id="status">加载中…</div>
       <div id="sub">点击己方棋子,再点击绿点处落子</div>
       <div id="info"></div>
@@ -102,28 +102,29 @@
     </div>
 
     <div class="card about">
-      <b>引擎说明</b><br>
-      · 极小极大 + α-β 剪枝<br>
-      · 迭代加深 + 时间控制<br>
-      · 置换表(Zobrist 哈希)<br>
-      · 静态搜索(避免水平线效应)<br>
-      · 杀手着法 / 历史启发排序<br>
-      · 子力价值 + 位置表评估<br>
+      <b>引擎说明 (v2)</b><br>
+      · 极小极大 + α-β 剪枝 + PVS 主变例搜索<br>
+      · 空着剪枝 + 后期着法缩减 (LMR)<br>
+      · 迭代加深 + 置换表 (Zobrist)<br>
+      · 静态搜索(被将军时搜索应将着法)<br>
+      · 杀手着法 / 历史启发 / MVV-LVA 排序<br>
+      · 子力价值 + 位置表 + 残局兵值调整<br>
+      · 整数棋盘编码, 节点速度优化<br>
       · 内置微型开局库<br>
       全部计算在浏览器本地完成
     </div>
   </div>
 </div>
 
-<!-- ==================== 搜索引擎(页面与 Worker 共用) ==================== -->
+<!-- ==================== 搜索引擎(页面与 Worker 共用) ====================
+     v2: 整数棋盘编码 (红 1-7, 黑 8-14, 0 空)
+         R=1 N=2 B=3 A=4 K=5 C=6 P=7 (黑 +7)
+     新增: 空着剪枝 / PVS / LMR / 应将静态搜索 / 强化评估
+======================================================================== -->
 <script id="engine-src">
 var XQ = (function(){
 'use strict';
 
-/* ---------- 棋盘表示 ----------
-   90 格一维数组, row 0 在顶部(黑方), row 9 在底部(红方)。
-   大写 = 红方, 小写 = 黑方。K帅 A仕 B相 N马 R车 C炮 P兵
----------------------------------------------------------------- */
 var INIT_ROWS = [
   'rnbakabnr',
   '.........',
@@ -136,49 +137,47 @@ var INIT_ROWS = [
   '.........',
   'RNBAKABNR'
 ];
+var CODE = 'RNBAKCP';
 var INIT_B = (function(){
   var a = new Array(90);
   for (var i = 0; i < 90; i++) {
     var ch = INIT_ROWS[(i/9)|0].charAt(i%9);
-    a[i] = ch === '.' ? 0 : ch;
+    if (ch === '.') { a[i] = 0; continue; }
+    var ci = CODE.indexOf(ch.toUpperCase());
+    a[i] = ch < 'a' ? ci + 1 : ci + 8;
   }
   return a;
 })();
 function initialBoard(){ return INIT_B.slice(); }
-function isRed(p){ return p >= 'A' && p <= 'Z'; }
+function isRed(p){ return p > 0 && p < 8; }
 
-var PCHARS = 'RNBAKPC';
-var PI = {};
-for (var _i = 0; _i < 7; _i++) {
-  PI[PCHARS.charAt(_i)] = _i;
-  PI[PCHARS.charAt(_i).toLowerCase()] = 7 + _i;
-}
-var VALC = [1100, 450, 120, 120, 0, 500, 90]; // 车马象士将炮兵
+/* 子力价值: 车 马 象 士 将 炮 兵 */
+var VALC = [1150, 470, 125, 125, 0, 510, 95];
 
-/* ---------- 子力位置表(红方视角, row0=顶部; 黑方镜像行) ---------- */
+/* ---------- 位置表(红方视角, row0=顶部; 黑方镜像行) ---------- */
 var PST_R = [
-  10,12,12,16,18,16,12,12,10,
-  12,16,16,22,24,22,16,16,12,
-  10,14,14,20,20,20,14,14,10,
-  10,14,16,20,22,20,16,14,10,
-   8,12,14,18,20,18,14,12, 8,
-   6,12,12,16,18,16,12,12, 6,
-   4,10,10,14,14,14,10,10, 4,
-   2, 8, 8,12,12,12, 8, 8, 2,
-   0, 6, 6,10,10,10, 6, 6, 0,
-  -2, 4, 6, 8, 8, 8, 6, 4,-2
+  14,14,12,18,16,18,12,14,14,
+  16,20,18,24,26,24,18,20,16,
+  12,12,12,18,18,18,12,12,12,
+  12,18,16,22,22,22,16,18,12,
+  12,14,12,18,18,18,12,14,12,
+  12,16,14,20,20,20,14,16,12,
+   6,10, 8,14,14,14, 8,10, 6,
+   4, 8, 6,14,12,14, 6, 8, 4,
+   8, 4, 8,16, 8,16, 8, 4, 8,
+  -2,10, 6,14,12,14, 6,10,-2
 ];
 var PST_N = [
-   2, 6,12,10, 6,10,12, 6, 2,
-   4,12,18,16,14,16,18,12, 4,
-   8,16,22,24,22,24,22,16, 8,
-  10,20,26,28,28,28,26,20,10,
-   8,18,24,26,26,26,24,18, 8,
-   6,16,20,24,24,24,20,16, 6,
-   4,12,16,20,20,20,16,12, 4,
-   2, 8,10,14,14,14,10, 8, 2,
-   0, 4, 8,10, 8,10, 8, 4, 0,
-  -4, 2, 4, 2, 4, 2, 4, 2,-4
+   4, 8,16,12, 4,12,16, 8, 4,
+   4,10,28,16, 8,16,28,10, 4,
+  12,14,16,20,18,20,16,14,12,
+   8,24,18,24,20,24,18,24, 8,
+   6,16,14,18,16,18,14,16, 6,
+   4,12,16,14,12,14,16,12, 4,
+   2, 6, 8, 6,10, 6, 8, 6, 2,
+   4, 2, 8, 8, 4, 8, 8, 2, 4,
+   0, 2, 4, 4,-2, 4, 4, 2, 0,
+   0,-4, 0, 0, 0, 0, 0,-4, 0
 ];
 var PST_B = new Array(90).fill(0);
 var PST_A = new Array(90).fill(0);
@@ -195,28 +194,28 @@ var PST_K = [
   0,0,0, 2, 6, 2,0,0,0
 ];
 var PST_C = [
-   4, 4, 0,-8,-8,-8, 0, 4, 4,
-   2, 2, 0,-4,-10,-4,0, 2, 2,
-   2, 2, 0,-8,-8,-8, 0, 2, 2,
-   0, 2, 4, 6, 6, 6, 4, 2, 0,
-   0, 0, 0, 4, 6, 4, 0, 0, 0,
-   0, 0, 2, 4, 8, 4, 2, 0, 0,
-   0, 0, 0, 2, 4, 2, 0, 0, 0,
-   0, 0, 2, 4, 8, 4, 2, 0, 0,
-  -2, 2, 4, 4, 4, 4, 4, 2,-2,
-  -2, 0, 2, 4, 4, 4, 2, 0,-2
+   6, 4, 0,-10,-12,-10, 0, 4, 6,
+   2, 2, 0, -4,-14, -4, 0, 2, 2,
+   2, 2, 0,-10, -8,-10, 0, 2, 2,
+   0, 0,-2,  4, 10,  4,-2, 0, 0,
+   0, 0, 0,  2,  8,  2, 0, 0, 0,
+  -2, 0, 4,  2,  6,  2, 4, 0,-2,
+   0, 0, 0,  2,  4,  2, 0, 0, 0,
+   4, 0, 8,  6, 10,  6, 8, 0, 4,
+   0, 2, 4,  6,  6,  6, 4, 2, 0,
+   0, 0, 2,  6,  6,  6, 2, 0, 0
 ];
 var PST_P = [
-   0, 0, 0, 2, 4, 2, 0, 0, 0,
-  20,30,50,65,70,65,50,30,20,
-  20,30,45,55,55,55,45,30,20,
-  15,25,35,45,45,45,35,25,15,
-  10,18,25,32,35,32,25,18,10,
-   5, 8,12,18,20,18,12, 8, 5,
-   0, 0, 2, 5, 8, 5, 2, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0,
-   0, 0, 0, 0, 0, 0, 0, 0, 0
+   0,  3,  6,  9, 12,  9,  6,  3,  0,
+  18, 36, 56, 80,120, 80, 56, 36, 18,
+  14, 26, 42, 60, 80, 60, 42, 26, 14,
+  10, 20, 30, 34, 40, 34, 30, 20, 10,
+   6, 12, 18, 18, 20, 18, 18, 12,  6,
+   2,  0,  8,  0,  8,  0,  8,  0,  2,
+   0,  0, -2,  0,  4,  0, -2,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0,
+   0,  0,  0,  0,  0,  0,  0,  0,  0
 ];
 var PSTS = [PST_R, PST_N, PST_B, PST_A, PST_K, PST_C, PST_P];
 
@@ -229,36 +228,34 @@ function mulberry32(a){
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
 }
-var Z = new Int32Array(14*90 + 1);
+var Z = new Int32Array(15*90 + 1);
 (function(){
   var rnd = mulberry32(0x5A11C0DE);
   for (var i = 0; i < Z.length; i++) Z[i] = (rnd()*4294967296)|0;
 })();
-var ZSIDE = Z[14*90];
+var ZSIDE = Z[15*90];
 function keyOf(bd, side){
   var k = 0;
-  for (var i = 0; i < 90; i++) { var p = bd[i]; if (p) k ^= Z[PI[p]*90 + i]; }
+  for (var i = 0; i < 90; i++) { var p = bd[i]; if (p) k ^= Z[p*90 + i]; }
   if (side === 1) k ^= ZSIDE;
   return k;
 }
 
-/* ---------- 方向表 ---------- */
-var KOFF = [[1,0],[-1,0],[0,1],[0,-1]];                       // 车/将
-var NOFF = [[2,1],[2,-1],[-2,1],[-2,-1],[1,2],[1,-2],[-1,2],[-1,-2]]; // 马
-var EOFF = [[2,2],[2,-2],[-2,2],[-2,-2]];                     // 象
-var DOFF = [[1,1],[1,-1],[-1,1],[-1,-1]];                     // 士
+var KOFF = [[1,0],[-1,0],[0,1],[0,-1]];
+var NOFF = [[2,1],[2,-1],[-2,1],[-2,-1],[1,2],[1,-2],[-1,2],[-1,-2]];
+var EOFF = [[2,2],[2,-2],[-2,2],[-2,-2]];
+var DOFF = [[1,1],[1,-1],[-1,1],[-1,-1]];
 
-/* ---------- 找将 ---------- */
 function findKing(bd, side){
-  var ch = side === 0 ? 'K' : 'k', i;
+  var kk = side === 0 ? 5 : 12, i;
   if (side === 0) {
-    for (i = 84; i <= 86; i++) if (bd[i] === ch) return i;
-    for (i = 75; i <= 77; i++) if (bd[i] === ch) return i;
-    for (i = 66; i <= 68; i++) if (bd[i] === ch) return i;
+    for (i = 84; i <= 86; i++) if (bd[i] === kk) return i;
+    for (i = 75; i <= 77; i++) if (bd[i] === kk) return i;
+    for (i = 66; i <= 68; i++) if (bd[i] === kk) return i;
   } else {
-    for (i = 3; i <= 5; i++) if (bd[i] === ch) return i;
-    for (i = 12; i <= 14; i++) if (bd[i] === ch) return i;
-    for (i = 21; i <= 23; i++) if (bd[i] === ch) return i;
+    for (i = 3; i <= 5; i++) if (bd[i] === kk) return i;
+    for (i = 12; i <= 14; i++) if (bd[i] === kk) return i;
+    for (i = 21; i <= 23; i++) if (bd[i] === kk) return i;
   }
   return -1;
 }
@@ -268,33 +265,31 @@ function inCheck(bd, side){
   var k = findKing(bd, side);
   if (k < 0) return true;
   var kr = (k/9)|0, kc = k%9;
-  var ek = side === 0 ? 'k' : 'K';
-  var er = side === 0 ? 'r' : 'R';
-  var ec = side === 0 ? 'c' : 'C';
-  var en = side === 0 ? 'n' : 'N';
-  var ep = side === 0 ? 'p' : 'P';
+  var er = side === 0 ? 8 : 1;    // 敌车
+  var ec = side === 0 ? 13 : 6;   // 敌炮
+  var en = side === 0 ? 9 : 2;    // 敌马
+  var ep = side === 0 ? 14 : 7;   // 敌兵
+  var ek = side === 0 ? 12 : 5;   // 敌将
 
-  // 4 个直线方向: 车 / 炮(隔一子) / 对脸将
-  for (var d = 0; d < 4; d++) {
+  for (var d = 0; d < 4; d++) {          // 车 / 炮 / 对脸将
     var dr = KOFF[d][0], dc = KOFF[d][1];
     var r = kr + dr, c = kc + dc, screens = 0;
     while (r >= 0 && r < 10 && c >= 0 && c < 9) {
       var p = bd[r*9 + c];
       if (p) {
         if (screens === 0) {
-          if (p === er) return true;              // 车
-          if (p === ek && dc === 0) return true;   // 对脸将
+          if (p === er) return true;
+          if (p === ek && dc === 0) return true;
           screens = 1;
         } else {
-          if (p === ec) return true;               // 炮隔一子打将
+          if (p === ec) return true;
           break;
         }
       }
       r += dr; c += dc;
     }
   }
-  // 马(检查蹩马腿)
-  for (var i = 0; i < 8; i++) {
+  for (var i = 0; i < 8; i++) {          // 马(蹩马腿)
     var dr2 = NOFF[i][0], dc2 = NOFF[i][1];
     var sr = kr + dr2, sc = kc + dc2;
     if (sr < 0 || sr > 9 || sc < 0 || sc > 8) continue;
@@ -304,45 +299,44 @@ function inCheck(bd, side){
     else                         { lr = kr + dr2;   lc = kc + dc2/2; }
     if (bd[lr*9 + lc] === 0) return true;
   }
-  // 兵
-  if (side === 0) { // 红将被黑兵攻击
-    if (kr-1 >= 0 && bd[(kr-1)*9 + kc] === 'p') return true;
+  if (side === 0) {                      // 红将被黑兵攻击
+    if (kr-1 >= 0 && bd[(kr-1)*9 + kc] === 14) return true;
     if (kr >= 5) {
-      if (kc-1 >= 0 && bd[kr*9 + kc-1] === 'p') return true;
-      if (kc+1 <= 8 && bd[kr*9 + kc+1] === 'p') return true;
+      if (kc-1 >= 0 && bd[kr*9 + kc-1] === 14) return true;
+      if (kc+1 <= 8 && bd[kr*9 + kc+1] === 14) return true;
     }
-  } else {          // 黑将被红兵攻击
-    if (kr+1 <= 9 && bd[(kr+1)*9 + kc] === 'P') return true;
+  } else {                               // 黑将被红兵攻击
+    if (kr+1 <= 9 && bd[(kr+1)*9 + kc] === 7) return true;
     if (kr <= 4) {
-      if (kc-1 >= 0 && bd[kr*9 + kc-1] === 'P') return true;
-      if (kc+1 <= 8 && bd[kr*9 + kc+1] === 'P') return true;
+      if (kc-1 >= 0 && bd[kr*9 + kc-1] === 7) return true;
+      if (kc+1 <= 8 && bd[kr*9 + kc+1] === 7) return true;
     }
   }
   return false;
 }
 
-/* ---------- 伪合法着法生成 ----------
-   着法编码: move = from<<7 | to
--------------------------------------*/
-function genMoves(st, capsOnly){
-  var bd = st.board, side = st.side, mv = [];
+/* ---------- 伪合法着法生成 (move = from<<7 | to) ---------- */
+function genMoves(st, capsOnly, buf){
+  var bd = st.board, side = st.side;
   var mine = side === 0;
+  var mv = buf || [];
+  mv.length = 0;
   for (var from = 0; from < 90; from++) {
     var p = bd[from];
-    if (!p || isRed(p) !== mine) continue;
+    if (!p || (p < 8) !== mine) continue;
     var r = (from/9)|0, c = from%9;
-    var u = p.toUpperCase();
-    if (u === 'R') {                       // 车: 滑行
+    var t = mine ? p : p - 7;               // 1..7
+    if (t === 1) {                          // 车
       for (var d = 0; d < 4; d++) {
         var rr = r + KOFF[d][0], cc = c + KOFF[d][1];
         while (rr >= 0 && rr < 10 && cc >= 0 && cc < 9) {
           var q = bd[rr*9 + cc];
           if (!q) { if (!capsOnly) mv.push(from<<7 | rr*9+cc); }
-          else { if (isRed(q) !== mine) mv.push(from<<7 | rr*9+cc); break; }
+          else { if ((q < 8) !== mine) mv.push(from<<7 | rr*9+cc); break; }
           rr += KOFF[d][0]; cc += KOFF[d][1];
         }
       }
-    } else if (u === 'C') {                // 炮: 平移空吃隔子
+    } else if (t === 6) {                   // 炮
       for (var d2 = 0; d2 < 4; d2++) {
         var rr2 = r + KOFF[d2][0], cc2 = c + KOFF[d2][1], jumped = false;
         while (rr2 >= 0 && rr2 < 10 && cc2 >= 0 && cc2 < 9) {
@@ -351,13 +345,13 @@ function genMoves(st, capsOnly){
             if (!q2) { if (!capsOnly) mv.push(from<<7 | rr2*9+cc2); }
             else jumped = true;
           } else if (q2) {
-            if (isRed(q2) !== mine) mv.push(from<<7 | rr2*9+cc2);
+            if ((q2 < 8) !== mine) mv.push(from<<7 | rr2*9+cc2);
             break;
           }
           rr2 += KOFF[d2][0]; cc2 += KOFF[d2][1];
         }
       }
-    } else if (u === 'N') {                // 马: 蹩马腿
+    } else if (t === 2) {                   // 马
       for (var i = 0; i < 8; i++) {
         var dr = NOFF[i][0], dc = NOFF[i][1];
         var tr = r + dr, tc = c + dc;
@@ -367,47 +361,47 @@ function genMoves(st, capsOnly){
         else                       { lr = r;         lc = c + dc/2; }
         if (bd[lr*9 + lc]) continue;
         var q3 = bd[tr*9 + tc];
-        if (q3 && isRed(q3) === mine) continue;
+        if (q3 && (q3 < 8) === mine) continue;
         if (capsOnly && !q3) continue;
         mv.push(from<<7 | tr*9+tc);
       }
-    } else if (u === 'B') {                // 象: 塞象眼 + 不过河
+    } else if (t === 3) {                   // 象
       for (var i2 = 0; i2 < 4; i2++) {
         var tr2 = r + EOFF[i2][0], tc2 = c + EOFF[i2][1];
         if (tr2 < 0 || tr2 > 9 || tc2 < 0 || tc2 > 8) continue;
         if (mine ? tr2 < 5 : tr2 > 4) continue;
         if (bd[(r + EOFF[i2][0]/2)*9 + (c + EOFF[i2][1]/2)]) continue;
         var q4 = bd[tr2*9 + tc2];
-        if (q4 && isRed(q4) === mine) continue;
+        if (q4 && (q4 < 8) === mine) continue;
         if (capsOnly && !q4) continue;
         mv.push(from<<7 | tr2*9+tc2);
       }
-    } else if (u === 'A') {                // 士: 九宫斜走
+    } else if (t === 4) {                   // 士
       for (var i3 = 0; i3 < 4; i3++) {
         var tr3 = r + DOFF[i3][0], tc3 = c + DOFF[i3][1];
         if (tr3 < 0 || tr3 > 9 || tc3 < 3 || tc3 > 5) continue;
         if (mine ? (tr3 < 7) : (tr3 > 2)) continue;
         var q5 = bd[tr3*9 + tc3];
-        if (q5 && isRed(q5) === mine) continue;
+        if (q5 && (q5 < 8) === mine) continue;
         if (capsOnly && !q5) continue;
         mv.push(from<<7 | tr3*9+tc3);
       }
-    } else if (u === 'K') {                // 帅: 九宫直走(对脸在合法性中处理)
+    } else if (t === 5) {                   // 帅
       for (var i4 = 0; i4 < 4; i4++) {
         var tr4 = r + KOFF[i4][0], tc4 = c + KOFF[i4][1];
         if (tr4 < 0 || tr4 > 9 || tc4 < 3 || tc4 > 5) continue;
         if (mine ? (tr4 < 7) : (tr4 > 2)) continue;
         var q6 = bd[tr4*9 + tc4];
-        if (q6 && isRed(q6) === mine) continue;
+        if (q6 && (q6 < 8) === mine) continue;
         if (capsOnly && !q6) continue;
         mv.push(from<<7 | tr4*9+tc4);
       }
-    } else {                               // 兵: 过河前只进, 过河后可横
+    } else {                                // 兵
       var fwd = mine ? -1 : 1;
       var tr5 = r + fwd;
       if (tr5 >= 0 && tr5 < 10) {
         var q7 = bd[tr5*9 + c];
-        if (!(q7 && isRed(q7) === mine) && (!capsOnly || q7))
+        if (!(q7 && (q7 < 8) === mine) && (!capsOnly || q7))
           mv.push(from<<7 | tr5*9+c);
       }
       if (mine ? r <= 4 : r >= 5) {
@@ -415,7 +409,7 @@ function genMoves(st, capsOnly){
           var tc5 = c + s;
           if (tc5 < 0 || tc5 > 8) continue;
           var q8 = bd[r*9 + tc5];
-          if (!(q8 && isRed(q8) === mine) && (!capsOnly || q8))
+          if (!(q8 && (q8 < 8) === mine) && (!capsOnly || q8))
             mv.push(from<<7 | r*9+tc5);
         }
       }
@@ -424,12 +418,25 @@ function genMoves(st, capsOnly){
   return mv;
 }
 
+/* ---------- 状态构建(含非兵子力计数, 用于空着剪枝保护) ---------- */
+function newState(board, side){
+  var np = [0, 0];
+  for (var i = 0; i < 90; i++) {
+    var p = board[i];
+    if (p && p !== 5 && p !== 7 && p !== 12 && p !== 14) np[p < 8 ? 0 : 1]++;
+  }
+  return { board: board.slice(), side: side, key: keyOf(board, side), np: np };
+}
+
 /* ---------- 走子 / 悔子 ---------- */
 function make(st, m){
   var from = m>>7, to = m&127, bd = st.board;
   var p = bd[from], cap = bd[to];
-  if (cap) st.key ^= Z[PI[cap]*90 + to];
-  st.key ^= Z[PI[p]*90 + from] ^ Z[PI[p]*90 + to];
+  if (cap) {
+    st.key ^= Z[cap*90 + to];
+    if (cap !== 5 && cap !== 7 && cap !== 12 && cap !== 14) st.np[cap < 8 ? 0 : 1]--;
+  }
+  st.key ^= Z[p*90 + from] ^ Z[p*90 + to];
   bd[to] = p; bd[from] = 0;
   st.key ^= ZSIDE;
   st.side ^= 1;
@@ -439,8 +446,11 @@ function unmake(st, m, cap){
   var from = m>>7, to = m&127, bd = st.board;
   var p = bd[to];
   bd[from] = p; bd[to] = cap;
-  if (cap) st.key ^= Z[PI[cap]*90 + to];
-  st.key ^= Z[PI[p]*90 + from] ^ Z[PI[p]*90 + to] ^ ZSIDE;
+  if (cap) {
+    st.key ^= Z[cap*90 + to];
+    if (cap !== 5 && cap !== 7 && cap !== 12 && cap !== 14) st.np[cap < 8 ? 0 : 1]++;
+  }
+  st.key ^= Z[p*90 + from] ^ Z[p*90 + to] ^ ZSIDE;
   st.side ^= 1;
 }
 
@@ -458,16 +468,24 @@ function legalMoves(st){
 /* ---------- 局面评估 ---------- */
 var st = null, noiseAmt = 0;
 function evaluate(bd){
-  var sc = 0;
+  var sc = 0, npt = 0, pcR = 0, pcB = 0, shR = 0, shB = 0;
   for (var i = 0; i < 90; i++) {
     var p = bd[i];
     if (!p) continue;
-    var red = isRed(p);
-    var t = PI[p] % 7;
+    var red = p < 8;
+    var t = red ? p - 1 : p - 8;
     var idx = red ? i : (9 - ((i/9)|0))*9 + i%9;
     var v = VALC[t] + PSTS[t][idx];
+    if (t === 0 || t === 1 || t === 5) npt += VALC[t];       // 双方车马炮总值
+    else if (t === 2 || t === 3) { if (red) shR += 4; else shB += 4; }  // 士象完整度
+    else if (t === 6) {                                       // 过河兵
+      var rr = (i/9)|0;
+      if (red ? rr <= 4 : rr >= 5) { if (red) pcR++; else pcB++; }
+    }
     sc += red ? v : -v;
   }
+  sc += shR - shB;
+  if (npt <= 600) sc += (pcR - pcB) * 35;                     // 残局过河兵增值
   if (noiseAmt) sc += ((Math.random()*2 - 1) * noiseAmt)|0;
   return st.side === 0 ? sc : -sc;
 }
@@ -485,11 +503,13 @@ var nodes = 0, deadline = 0, stopped = false;
 var killers = null, histTab = null;
 var pathKeys = [], gameKeys = [];
 var SCRATCH = new Array(512);
+var MBUF = [];
+for (var _m = 0; _m < 128; _m++) MBUF.push([]);
 
 function scoreMove(m, ttm, ply){
   if (m === ttm) return 1e9;
   var v = st.board[m&127];
-  if (v) return 1e6 + (VALC[PI[v]%7]<<4) - VALC[PI[st.board[m>>7]]%7];
+  if (v) return 1e6 + (VALC[(v < 8 ? v : v - 7) - 1]<<4) - VALC[(st.board[m>>7] < 8 ? st.board[m>>7] : st.board[m>>7] - 7) - 1];
   if (m === killers[ply*2])   return 900000;
   if (m === killers[ply*2+1]) return 800000;
   return histTab[(m>>7)*90 + (m&127)];
@@ -497,14 +517,16 @@ function scoreMove(m, ttm, ply){
 function orderMoves(ms, ttm, ply){
   var n = ms.length, sc = SCRATCH;
   for (var i = 0; i < n; i++) sc[i] = scoreMove(ms[i], ttm, ply);
-  for (var i2 = 1; i2 < n; i2++) {          // 插入排序(按分降序)
+  for (var i2 = 1; i2 < n; i2++) {
     var m = ms[i2], s = sc[i2], j = i2 - 1;
     while (j >= 0 && sc[j] < s) { ms[j+1] = ms[j]; sc[j+1] = sc[j]; j--; }
     ms[j+1] = m; sc[j+1] = s;
   }
 }
 
-/* ---------- 静态搜索: 只延伸吃子, 直到局面安静 ---------- */
+/* ---------- 静态搜索: 只延伸吃子, 直到局面安静 ----------
+   注: 被将军的局面由主搜索的"将军延伸"处理, 此处不做全宽应将
+   (实测全宽应将在 JS 速度下会让搜索树爆炸, 反而降低棋力) ---------- */
 function qsearch(alpha, beta, ply){
   nodes++;
   if ((nodes & 1023) === 0 && Date.now() > deadline) { stopped = true; return 0; }
@@ -513,7 +535,7 @@ function qsearch(alpha, beta, ply){
   if (stand >= beta) return beta;
   if (stand > alpha) alpha = stand;
   if (ply >= 100) return alpha;
-  var ms = genMoves(st, true);
+  var ms = genMoves(st, true, MBUF[ply]);
   orderMoves(ms, 0, ply);
   for (var i = 0; i < ms.length; i++) {
     var m = ms[i], mover = st.side;
@@ -528,20 +550,19 @@ function qsearch(alpha, beta, ply){
   return alpha;
 }
 
-/* ---------- 主搜索: negamax + α-β + 置换表 + 将军延伸 ---------- */
-function search(depth, alpha, beta, ply){
+/* ---------- 主搜索: negamax + α-β + PVS + 空着剪枝 + LMR ---------- */
+function search(depth, alpha, beta, ply, allowNull){
   if (stopped) return 0;
   nodes++;
   if ((nodes & 1023) === 0 && Date.now() > deadline) { stopped = true; return 0; }
   if (ply >= 100) return evaluate(st.board);
 
-  // 重复局面判和(路径内 + 历史局面)
   var key = st.key, L = pathKeys.length;
-  for (var j = L-3; j >= 0; j -= 2) if (pathKeys[j] === key) return 0;
+  for (var j = L-2; j >= 0; j--) if (pathKeys[j] === key) return 0;
   if (gameKeys.length && gameKeys.indexOf(key) >= 0) return 0;
 
   var inChk = inCheck(st.board, st.side);
-  if (inChk) depth++;                       // 将军延伸
+  if (inChk) depth++;
   if (depth <= 0) return qsearch(alpha, beta, ply);
 
   var ti = (key>>>0) & TT_MASK, ttm = 0;
@@ -557,23 +578,45 @@ function search(depth, alpha, beta, ply){
     }
   }
 
-  var ms = genMoves(st, false);
+  // 空着剪枝: 不走子直接让对方行棋, 若仍能守得住则可剪枝
+  if (allowNull && !inChk && depth >= 3 && beta < 29000 && st.np[st.side] > 0) {
+    st.side ^= 1; st.key ^= ZSIDE; pathKeys.push(st.key);
+    var ns = -search(depth-3, -beta, -beta+1, ply+1, false);
+    pathKeys.pop(); st.side ^= 1; st.key ^= ZSIDE;
+    if (stopped) return 0;
+    if (ns >= beta) return beta;
+  }
+
+  var ms = genMoves(st, false, MBUF[ply]);
   orderMoves(ms, ttm, ply);
   var best = -60001, bestM = 0, legal = 0, a0 = alpha;
 
   for (var i = 0; i < ms.length; i++) {
-    var m = ms[i], mover = st.side;
-    var cap = make(st, m);
+    var m = ms[i];
+    var cap = st.board[m&127];
+    var mover = st.side;
+    var mk = make(st, m);
     pathKeys.push(st.key);
-    if (inCheck(st.board, mover)) { unmake(st, m, cap); pathKeys.pop(); continue; }
+    if (inCheck(st.board, mover)) { unmake(st, m, mk); pathKeys.pop(); continue; }
     legal++;
-    var sc = -search(depth-1, -beta, -alpha, ply+1);
-    unmake(st, m, cap); pathKeys.pop();
+    var sc;
+    var isQuiet = !cap && !inChk;
+    if (i === 0) {                                   // 主要变例: 全窗口
+      sc = -search(depth-1, -beta, -alpha, ply+1, true);
+    } else {                                         // PVS 零窗口 + LMR
+      var red = (depth >= 3 && i >= 4 && isQuiet) ? 1 + (i >= 12 ? 1 : 0) : 0;
+      sc = -search(depth-1-red, -alpha-1, -alpha, ply+1, true);
+      if (sc > alpha && red > 0)
+        sc = -search(depth-1, -alpha-1, -alpha, ply+1, true);
+      if (sc > alpha && sc < beta)
+        sc = -search(depth-1, -beta, -alpha, ply+1, true);
+    }
+    unmake(st, m, mk); pathKeys.pop();
     if (stopped) return 0;
     if (sc > best) { best = sc; bestM = m; }
     if (sc > alpha) alpha = sc;
-    if (alpha >= beta) {                    // β截断
-      if (!st.board[m&127]) {              // 安静着法 → 杀手/历史
+    if (alpha >= beta) {
+      if (isQuiet) {
         killers[ply*2+1] = killers[ply*2]; killers[ply*2] = m;
         histTab[(m>>7)*90 + (m&127)] += depth*depth;
       }
@@ -583,7 +626,7 @@ function search(depth, alpha, beta, ply){
       return best;
     }
   }
-  if (legal === 0) return -30000 + ply;     // 被将死或困毙
+  if (legal === 0) return -30000 + ply;
   ttKey[ti] = key; ttMove[ti] = bestM;
   var s2 = best; if (s2 > 29900) s2 += ply; else if (s2 < -29900) s2 -= ply;
   ttScore[ti] = s2; ttDepth[ti] = depth > 127 ? 127 : depth;
@@ -611,12 +654,9 @@ function bookMove(s, roots){
   return ok[(Math.random()*ok.length)|0];
 }
 
-/* ---------- 顶层思考入口 ----------
-   board: 90格数组  side: 0红 1黑
-   返回 {move, score, depth, nodes, ms} 或 null(无着法)
------------------------------------------------- */
+/* ---------- 顶层思考入口 ---------- */
 function think(board, side, gKeys, timeMs, maxDepth, noise){
-  st = { board: board.slice(), side: side, key: keyOf(board, side) };
+  st = newState(board, side);
   ttKey.fill(0);
   killers = new Int32Array(240);
   histTab = new Int32Array(8100);
@@ -633,29 +673,28 @@ function think(board, side, gKeys, timeMs, maxDepth, noise){
   var bestMove = roots[0], bestScore = 0, bestDepth = 0, t0 = Date.now();
   var scores = {};
 
-  for (var d = 1; d <= maxDepth; d++) {      // 迭代加深
+  for (var d = 1; d <= maxDepth; d++) {
     var iterBest = 0, iterScore = -60001, alpha = -60001;
     for (var i = 0; i < roots.length; i++) {
       var m = roots[i];
       var cap = make(st, m);
       pathKeys.push(st.key);
-      var sc = -search(d-1, -60001, -alpha, 1);
+      var sc = -search(d-1, -60001, -alpha, 1, true);
       unmake(st, m, cap); pathKeys.pop();
       if (stopped) break;
       scores[m] = sc;
       if (sc > iterScore) { iterScore = sc; iterBest = m; }
       if (sc > alpha) alpha = sc;
     }
-    if (stopped) break;                      // 超时, 沿用上一层结果
+    if (stopped) break;
     bestMove = iterBest || bestMove;
     bestScore = iterScore; bestDepth = d;
-    if (bestScore > 29900) break;            // 已找到杀
+    if (bestScore > 29900) break;
     roots.sort(function(a, b){
       return ((scores[b] !== undefined ? scores[b] : -60001) -
               (scores[a] !== undefined ? scores[a] : -60001));
     });
   }
-  // 同分着法随机选择, 增加对局多样性
   if (bestScore < 29900) {
     var cands = [];
     for (var i2 = 0; i2 < roots.length; i2++) {
@@ -668,7 +707,7 @@ function think(board, side, gKeys, timeMs, maxDepth, noise){
 }
 
 return {
-  initialBoard: initialBoard, isRed: isRed,
+  initialBoard: initialBoard, isRed: isRed, newState: newState,
   genMoves: genMoves, make: make, unmake: unmake,
   legalMoves: legalMoves, inCheck: inCheck, keyOf: keyOf,
   think: think, VALC: VALC
@@ -691,17 +730,16 @@ self.onmessage = function(e){
 'use strict';
 var $ = function(s){ return document.querySelector(s); };
 
-/* ---------- 常量 ---------- */
 var LEVELS = {
-  easy:   { label: '简单', time: 300,  depth: 2,  noise: 60 },
-  medium: { label: '中等', time: 900,  depth: 8,  noise: 0  },
-  hard:   { label: '困难', time: 2800, depth: 16, noise: 0  },
-  master: { label: '大师', time: 8000, depth: 64, noise: 0  }
+  easy:   { label: '简单', time: 300,   depth: 2,  noise: 60 },
+  medium: { label: '中等', time: 1500,  depth: 30, noise: 0  },
+  hard:   { label: '困难', time: 4000,  depth: 64, noise: 0  },
+  master: { label: '大师', time: 10000, depth: 64, noise: 0  }
 };
-var GLYPH = { K:'帥',A:'仕',B:'相',N:'傌',R:'俥',C:'炮',P:'兵',
-              k:'將',a:'士',b:'象',n:'馬',r:'車',c:'砲',p:'卒' };
+/* 整数棋子 → 字形 */
+var GLYPH = { 1:'俥',2:'傌',3:'相',4:'仕',5:'帥',6:'炮',7:'兵',
+              8:'車',9:'馬',10:'象',11:'士',12:'將',13:'砲',14:'卒' };
 
-/* ---------- 画布 ---------- */
 var cv = $('#board'), ctx = cv.getContext('2d');
 var CELL = 56, M = 44, W = CELL*8 + M*2, H = CELL*9 + M*2;
 var dpr = window.devicePixelRatio || 1;
@@ -709,7 +747,6 @@ cv.width = W*dpr; cv.height = H*dpr;
 cv.style.width = W+'px'; cv.style.height = H+'px';
 ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-/* ---------- 对局状态 ---------- */
 var state = null, history = [], gameKeys = [];
 var playerSide = 0, level = 'medium';
 var sel = -1, targets = [], lastMove = 0;
@@ -717,7 +754,6 @@ var thinking = false, over = false, flip = false;
 
 function sideName(s){ return s === 0 ? '红' : '黑'; }
 
-/* ---------- 坐标(玩家执黑时旋转 180°) ---------- */
 function XY(r, c){
   if (flip) { r = 9 - r; c = 8 - c; }
   return [M + c*CELL, M + r*CELL];
@@ -731,7 +767,6 @@ function RC(x, y){
   return r*9 + c;
 }
 
-/* ---------- 绘制 ---------- */
 function line(a, b){ ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); }
 
 function mark(r, c){
@@ -764,7 +799,6 @@ function drawPiece(x, y, p){
 
 function render(){
   ctx.clearRect(0, 0, W, H);
-  // 棋盘底色
   var bg = ctx.createLinearGradient(0, 0, W, H);
   bg.addColorStop(0, '#f3ddb0'); bg.addColorStop(1, '#e0ba80');
   ctx.fillStyle = bg;
@@ -772,32 +806,26 @@ function render(){
   if (ctx.roundRect) ctx.roundRect(3, 3, W-6, H-6, 8); else ctx.rect(3, 3, W-6, H-6);
   ctx.fill();
 
-  // 外框
   var o0 = XY(0, 0), o1 = XY(9, 8);
   ctx.strokeStyle = '#8a5a24'; ctx.lineWidth = 3;
   ctx.strokeRect(Math.min(o0[0],o1[0])-7, Math.min(o0[1],o1[1])-7,
                  Math.abs(o1[0]-o0[0])+14, Math.abs(o1[1]-o0[1])+14);
 
-  // 网格
   ctx.strokeStyle = 'rgba(70,40,10,.85)'; ctx.lineWidth = 1.2;
   for (var r = 0; r <= 9; r++) line(XY(r, 0), XY(r, 8));
   line(XY(0, 0), XY(9, 0)); line(XY(0, 8), XY(9, 8));
   for (var c = 1; c <= 7; c++) { line(XY(0, c), XY(4, c)); line(XY(5, c), XY(9, c)); }
-  // 九宫斜线
   line(XY(0, 3), XY(2, 5)); line(XY(0, 5), XY(2, 3));
   line(XY(7, 3), XY(9, 5)); line(XY(7, 5), XY(9, 3));
-  // 炮/兵位标记
   ctx.lineWidth = 1.2; ctx.strokeStyle = 'rgba(90,50,10,.9)';
   [[2,1],[2,7],[7,1],[7,7]].forEach(function(p){ mark(p[0], p[1]); });
   for (var pc = 0; pc <= 8; pc += 2) { mark(3, pc); mark(6, pc); }
-  // 楚河汉界
   ctx.fillStyle = 'rgba(90,58,16,.5)';
   ctx.font = '30px KaiTi,STKaiti,serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   var ry = (XY(4,0)[1] + XY(5,0)[1]) / 2;
   ctx.fillText('楚  河', (XY(0,1)[0]+XY(0,3)[0])/2, ry);
   ctx.fillText('漢  界', (XY(0,5)[0]+XY(0,7)[0])/2, ry);
 
-  // 最近一步标记
   if (lastMove) {
     var lfr = (lastMove>>7)/9|0, lfc = (lastMove>>7)%9;
     var ltr = (lastMove&127)/9|0, ltc = (lastMove&127)%9;
@@ -808,7 +836,6 @@ function render(){
     });
   }
 
-  // 可走点
   targets.forEach(function(t){
     var xy = XY((t/9)|0, t%9);
     if (state.board[t]) {
@@ -820,7 +847,6 @@ function render(){
     }
   });
 
-  // 棋子
   for (var i = 0; i < 90; i++) {
     var p = state.board[i];
     if (!p) continue;
@@ -835,7 +861,6 @@ function render(){
   }
 }
 
-/* ---------- 状态栏 ---------- */
 function setStatus(){
   var el = $('#status');
   if (over) { el.textContent = '对局结束'; }
@@ -850,10 +875,9 @@ function setStatus(){
     + (history.length ? ' · 第 ' + Math.ceil(history.length/2) + ' 回合' : '');
 }
 
-/* ---------- 对局流程 ---------- */
 function newGame(side){
   var b = XQ.initialBoard();
-  state = { board: b, side: 0, key: XQ.keyOf(b, 0) };
+  state = XQ.newState(b, 0);
   playerSide = side; flip = (side === 1);
   history = []; gameKeys = [state.key];
   sel = -1; targets = []; lastMove = 0;
@@ -896,7 +920,6 @@ function applyMove(m){
   return cap;
 }
 
-/* ---------- AI 调度(Worker + 同步兜底) ---------- */
 var worker = null, aiToken = 0, pendingReq = null, watchdog = 0;
 try {
   var src = document.getElementById('engine-src').textContent + '\n' +
@@ -948,7 +971,6 @@ function onAIReply(msg){
   if (!checkEnd()) setStatus();
 }
 
-/* ---------- 交互 ---------- */
 cv.addEventListener('click', function(e){
   if (thinking || over || state.side !== playerSide) return;
   var rect = cv.getBoundingClientRect();
@@ -956,10 +978,10 @@ cv.addEventListener('click', function(e){
               (e.clientY - rect.top) * H / rect.height);
   if (sq < 0) { sel = -1; targets = []; render(); return; }
   var p = state.board[sq];
-  if (targets.indexOf(sq) >= 0) {                    // 落子
+  if (targets.indexOf(sq) >= 0) {
     applyMove((sel<<7) | sq);
     if (!checkEnd()) askAI();
-  } else if (p && XQ.isRed(p) === (playerSide === 0)) { // 选子
+  } else if (p && XQ.isRed(p) === (playerSide === 0)) {
     sel = sq;
     targets = XQ.legalMoves(state)
       .filter(function(m){ return (m>>7) === sq; })
@@ -968,12 +990,8 @@ cv.addEventListener('click', function(e){
   } else { sel = -1; targets = []; render(); }
 });
 
-$('#btnNew').addEventListener('click', function(){
-  newGame(+$('#selSide').value);
-});
-$('#btnAgain').addEventListener('click', function(){
-  newGame(+$('#selSide').value);
-});
+$('#btnNew').addEventListener('click', function(){ newGame(+$('#selSide').value); });
+$('#btnAgain').addEventListener('click', function(){ newGame(+$('#selSide').value); });
 $('#btnUndo').addEventListener('click', function(){
   if (thinking || !history.length) return;
   do {
